@@ -29,19 +29,14 @@ func New(version string) func() *schema.Provider {
 	return func() *schema.Provider {
 		p := &schema.Provider{
 			Schema: map[string]*schema.Schema{
-				"username": {
-					Description: "Local user name for the Unifi controller API. Can be specified with the `UNIFI_USERNAME` " +
-						"environment variable.",
+				"api_key": {
+					Description: "API key for the UniFi controller. Can be specified with the `UNIFI_API_KEY` " +
+						"environment variable. Generate this from your UniFi controller under " +
+						"Settings > Control Plane > Integrations.",
 					Type:        schema.TypeString,
 					Required:    true,
-					DefaultFunc: schema.EnvDefaultFunc("UNIFI_USERNAME", ""),
-				},
-				"password": {
-					Description: "Password for the user accessing the API. Can be specified with the `UNIFI_PASSWORD` " +
-						"environment variable.",
-					Type:        schema.TypeString,
-					Required:    true,
-					DefaultFunc: schema.EnvDefaultFunc("UNIFI_PASSWORD", ""),
+					Sensitive:   true,
+					DefaultFunc: schema.EnvDefaultFunc("UNIFI_API_KEY", ""),
 				},
 				"api_url": {
 					Description: "URL of the controller API. Can be specified with the `UNIFI_API` environment variable. " +
@@ -107,16 +102,14 @@ func New(version string) func() *schema.Provider {
 
 func configure(version string, p *schema.Provider) schema.ConfigureContextFunc {
 	return func(ctx context.Context, d *schema.ResourceData) (interface{}, diag.Diagnostics) {
-		user := d.Get("username").(string)
-		pass := d.Get("password").(string)
+		apiKey := d.Get("api_key").(string)
 		baseURL := d.Get("api_url").(string)
 		site := d.Get("site").(string)
 		insecure := d.Get("allow_insecure").(bool)
 
 		c := &client{
 			c: &lazyClient{
-				user:     user,
-				pass:     pass,
+				apiKey:   apiKey,
 				baseURL:  baseURL,
 				insecure: insecure,
 			},

@@ -56,13 +56,18 @@ type Client struct {
 	loginPath  string
 	statusPath string
 
-	csrf string
+	csrf   string
+	apiKey string
 
 	version string
 }
 
 func (c *Client) CSRFToken() string {
 	return c.csrf
+}
+
+func (c *Client) SetAPIKey(key string) {
+	c.apiKey = key
 }
 
 func (c *Client) Version() string {
@@ -190,6 +195,52 @@ func (c *Client) Login(ctx context.Context, user, pass string) error {
 	return nil
 }
 
+// InitWithAPIKey initializes the client with API key authentication instead of username/password
+func (c *Client) InitWithAPIKey(ctx context.Context, apiKey string) error {
+	if c.c == nil {
+		c.c = &http.Client{}
+	}
+
+	c.apiKey = apiKey
+
+	err := c.setAPIUrlStyle(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to determine API URL style: %w", err)
+	}
+
+	var status struct {
+		Meta struct {
+			ServerVersion string `json:"server_version"`
+			UUID          string `json:"uuid"`
+		} `json:"meta"`
+	}
+
+	err = c.do(ctx, "GET", c.statusPath, nil, &status)
+	if err != nil {
+		return err
+	}
+
+	if version := status.Meta.ServerVersion; version != "" {
+		c.version = status.Meta.ServerVersion
+		return nil
+	}
+
+	// newer version of 6.0 controller, use sysinfo to determine version
+	// using default site since it must exist
+	si, err := c.sysinfo(ctx, "default")
+	if err != nil {
+		return err
+	}
+
+	c.version = si.Version
+
+	if c.version == "" {
+		return errors.New("unable to determine controller version")
+	}
+
+	return nil
+}
+
 func (c *Client) do(ctx context.Context, method, relativeURL string, reqBody interface{}, respBody interface{}) error {
 	// single threading requests, this is mostly to assist in CSRF token propagation
 	c.Lock()
@@ -224,6 +275,10 @@ func (c *Client) do(ctx context.Context, method, relativeURL string, reqBody int
 
 	req.Header.Set("User-Agent", "terraform-provider-unifi/0.1")
 	req.Header.Add("Content-Type", "application/json; charset=utf-8")
+
+	if c.apiKey != "" {
+		req.Header.Set("X-API-KEY", c.apiKey)
+	}
 
 	if c.csrf != "" {
 		req.Header.Set("X-Csrf-Token", c.csrf)

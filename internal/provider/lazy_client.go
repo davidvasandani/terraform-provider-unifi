@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
 	"sync"
 	"time"
 
@@ -17,8 +16,7 @@ import (
 
 type lazyClient struct {
 	baseURL   string
-	user      string
-	pass      string
+	apiKey    string
 	insecure  bool
 	subsystem string
 
@@ -47,9 +45,6 @@ func setHTTPClient(c *unifi.Client, insecure bool, subsystem string) {
 
 	httpClient.Transport = logging.NewSubsystemLoggingHTTPTransport(subsystem, httpClient.Transport)
 
-	jar, _ := cookiejar.New(nil)
-	httpClient.Jar = jar
-
 	c.SetHTTPClient(httpClient)
 }
 
@@ -65,7 +60,7 @@ func (c *lazyClient) init(ctx context.Context) error {
 			return
 		}
 
-		initErr = c.inner.Login(ctx, c.user, c.pass)
+		initErr = c.inner.InitWithAPIKey(ctx, c.apiKey)
 		if initErr != nil {
 			return
 		}
