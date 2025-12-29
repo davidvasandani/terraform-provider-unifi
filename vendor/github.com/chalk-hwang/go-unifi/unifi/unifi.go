@@ -7,13 +7,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	maxRetries       = 5
+	baseRetryDelay   = 2 * time.Second
+	maxRetryDelay    = 30 * time.Second
 )
 
 const (
@@ -259,17 +267,13 @@ func (c *Client) do(ctx context.Context, method, relativeURL string, reqBody int
 	c.Lock()
 	defer c.Unlock()
 
-	var (
-		reqReader io.Reader
-		err       error
-		reqBytes  []byte
-	)
+	var reqBytes []byte
+	var err error
 	if reqBody != nil {
 		reqBytes, err = json.Marshal(reqBody)
 		if err != nil {
 			return fmt.Errorf("unable to marshal JSON: %s %s %w", method, relativeURL, err)
 		}
-		reqReader = bytes.NewReader(reqBytes)
 	}
 
 	reqURL, err := url.Parse(relativeURL)
@@ -280,70 +284,141 @@ func (c *Client) do(ctx context.Context, method, relativeURL string, reqBody int
 		reqURL.Path = path.Join(c.apiPath, reqURL.Path)
 	}
 
-	url := c.baseURL.ResolveReference(reqURL)
-	req, err := http.NewRequestWithContext(ctx, method, url.String(), reqReader)
-	if err != nil {
-		return fmt.Errorf("unable to create request: %s %s %w", method, relativeURL, err)
-	}
+	fullURL := c.baseURL.ResolveReference(reqURL)
 
-	req.Header.Set("User-Agent", "terraform-provider-unifi/0.1")
-	req.Header.Add("Content-Type", "application/json; charset=utf-8")
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Create fresh reader for each attempt (request body can only be read once)
+		var reqReader io.Reader
+		if reqBytes != nil {
+			reqReader = bytes.NewReader(reqBytes)
+		}
 
-	if c.apiKey != "" {
-		req.Header.Set("X-API-KEY", c.apiKey)
-	}
+		req, err := http.NewRequestWithContext(ctx, method, fullURL.String(), reqReader)
+		if err != nil {
+			return fmt.Errorf("unable to create request: %s %s %w", method, relativeURL, err)
+		}
 
-	if c.csrf != "" {
-		req.Header.Set("X-Csrf-Token", c.csrf)
-	}
+		req.Header.Set("User-Agent", "terraform-provider-unifi/0.1")
+		req.Header.Add("Content-Type", "application/json; charset=utf-8")
 
-	resp, err := c.c.Do(req)
-	if err != nil {
-		return fmt.Errorf("unable to perform request: %s %s %w", method, relativeURL, err)
-	}
-	defer resp.Body.Close()
+		if c.apiKey != "" {
+			req.Header.Set("X-API-KEY", c.apiKey)
+		}
 
-	if resp.StatusCode == http.StatusNotFound {
-		return &NotFoundError{}
-	}
+		if c.csrf != "" {
+			req.Header.Set("X-Csrf-Token", c.csrf)
+		}
 
-	if csrf := resp.Header.Get("X-Csrf-Token"); csrf != "" {
-		c.csrf = resp.Header.Get("X-Csrf-Token")
-	}
+		resp, err := c.c.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("unable to perform request: %s %s %w", method, relativeURL, err)
+			continue
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		errBody := struct {
-			Meta meta `json:"meta"`
-			Data []struct {
+		// Update CSRF token if present
+		if csrf := resp.Header.Get("X-Csrf-Token"); csrf != "" {
+			c.csrf = csrf
+		}
+
+		// Handle rate limiting (429 Too Many Requests)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
+			retryDelay := c.calculateRetryDelay(resp, attempt)
+			log.Printf("[WARN] Rate limited (429) for %s %s, retrying in %v (attempt %d/%d)",
+				method, relativeURL, retryDelay, attempt+1, maxRetries)
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(retryDelay):
+				continue
+			}
+		}
+
+		// Handle not found
+		if resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return &NotFoundError{}
+		}
+
+		// Handle other errors
+		if resp.StatusCode != http.StatusOK {
+			errBody := struct {
 				Meta meta `json:"meta"`
-			} `json:"data"`
-		}{}
-		if err = json.NewDecoder(resp.Body).Decode(&errBody); err != nil {
-			return err
-		}
-		var apiErr error
-		if len(errBody.Data) > 0 && errBody.Data[0].Meta.RC == "error" {
-			// check first error in data, should we look for more than one?
-			apiErr = errBody.Data[0].Meta.error()
-		}
-		if apiErr == nil {
-			apiErr = errBody.Meta.error()
-		}
-		return fmt.Errorf("%w (%s) for %s %s", apiErr, resp.Status, method, url.String())
-	}
+				Data []struct {
+					Meta meta `json:"meta"`
+				} `json:"data"`
+			}{}
+			if err = json.NewDecoder(resp.Body).Decode(&errBody); err != nil {
+				resp.Body.Close()
+				return err
+			}
+			resp.Body.Close()
 
-	if respBody == nil || resp.ContentLength == 0 {
+			var apiErr error
+			if len(errBody.Data) > 0 && errBody.Data[0].Meta.RC == "error" {
+				apiErr = errBody.Data[0].Meta.error()
+			}
+			if apiErr == nil {
+				apiErr = errBody.Meta.error()
+			}
+			return fmt.Errorf("%w (%s) for %s %s", apiErr, resp.Status, method, fullURL.String())
+		}
+
+		// Success - decode response if needed
+		if respBody == nil || resp.ContentLength == 0 {
+			resp.Body.Close()
+			return nil
+		}
+
+		err = json.NewDecoder(resp.Body).Decode(respBody)
+		resp.Body.Close()
+		if err != nil {
+			return fmt.Errorf("unable to decode body: %s %s %w", method, relativeURL, err)
+		}
+
 		return nil
 	}
 
-	// TODO: check rc in addition to status code?
+	if lastErr != nil {
+		return fmt.Errorf("max retries exceeded after %d attempts: %w", maxRetries, lastErr)
+	}
+	return fmt.Errorf("max retries exceeded after %d attempts due to rate limiting", maxRetries)
+}
 
-	err = json.NewDecoder(resp.Body).Decode(respBody)
-	if err != nil {
-		return fmt.Errorf("unable to decode body: %s %s %w", method, relativeURL, err)
+// calculateRetryDelay determines how long to wait before retrying
+func (c *Client) calculateRetryDelay(resp *http.Response, attempt int) time.Duration {
+	// Check for Retry-After header
+	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+		// Try parsing as seconds
+		if seconds, err := strconv.Atoi(retryAfter); err == nil {
+			delay := time.Duration(seconds) * time.Second
+			if delay > maxRetryDelay {
+				return maxRetryDelay
+			}
+			return delay
+		}
+		// Try parsing as HTTP date (RFC1123)
+		if t, err := time.Parse(time.RFC1123, retryAfter); err == nil {
+			delay := time.Until(t)
+			if delay > maxRetryDelay {
+				return maxRetryDelay
+			}
+			if delay > 0 {
+				return delay
+			}
+		}
 	}
 
-	return nil
+	// Exponential backoff with jitter
+	delay := baseRetryDelay * time.Duration(1<<uint(attempt))
+	if delay > maxRetryDelay {
+		delay = maxRetryDelay
+	}
+	return delay
 }
 
 type meta struct {
