@@ -13,6 +13,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -100,42 +101,54 @@ func (c *Client) setAPIUrlStyle(ctx context.Context) error {
 	// see https://github.com/unifi-poller/unifi/blob/4dc44f11f61a2e08bf7ec5b20c71d5bced837b5d/unifi.go#L101-L104
 	// and https://github.com/unifi-poller/unifi/commit/43a6b225031a28f2b358f52d03a7217c7b524143
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL.String(), nil)
-	if err != nil {
-		return err
-	}
+	// Retry logic for connection issues
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
 
-	// We can't share these cookies with other requests, so make a new client.
-	// Checking the return code on the first request so don't follow a redirect.
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Transport: c.c.Transport,
-	}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL.String(), nil)
+		if err != nil {
+			return err
+		}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+		// We can't share these cookies with other requests, so make a new client.
+		// Checking the return code on the first request so don't follow a redirect.
+		// Include a timeout to prevent hanging on API style detection.
+		client := &http.Client{
+			Timeout: 15 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+			Transport: c.c.Transport,
+		}
 
-	if resp.StatusCode == http.StatusOK {
-		// the new API returns a 200 for a / request
-		c.apiPath = apiPathNew
-		c.apiV2Path = apiV2PathNew
-		c.loginPath = loginPathNew
-		c.statusPath = statusPathNew
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue // retry
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+
+		if resp.StatusCode == http.StatusOK {
+			// the new API returns a 200 for a / request
+			c.apiPath = apiPathNew
+			c.apiV2Path = apiV2PathNew
+			c.loginPath = loginPathNew
+			c.statusPath = statusPathNew
+			return nil
+		}
+
+		// The old version returns a "302" (to /manage) for a / request
+		c.apiPath = apiPath
+		c.apiV2Path = apiV2Path
+		c.loginPath = loginPath
+		c.statusPath = statusPath
 		return nil
 	}
-
-	// The old version returns a "302" (to /manage) for a / request
-	c.apiPath = apiPath
-	c.apiV2Path = apiV2Path
-	c.loginPath = loginPath
-	c.statusPath = statusPath
-	return nil
+	return lastErr
 }
 
 func (c *Client) Login(ctx context.Context, user, pass string) error {

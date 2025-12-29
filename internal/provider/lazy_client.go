@@ -20,12 +20,16 @@ type lazyClient struct {
 	insecure  bool
 	subsystem string
 
-	once  sync.Once
-	inner *unifi.Client
+	once    sync.Once
+	inner   *unifi.Client
+	initErr error // stores initialization error
 }
 
 func setHTTPClient(c *unifi.Client, insecure bool, subsystem string) {
-	httpClient := &http.Client{}
+	httpClient := &http.Client{
+		// Set overall request timeout to prevent hanging
+		Timeout: 60 * time.Second,
+	}
 	httpClient.Transport = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -33,10 +37,15 @@ func setHTTPClient(c *unifi.Client, insecure bool, subsystem string) {
 			KeepAlive: 30 * time.Second,
 			DualStack: true,
 		}).DialContext,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		// Disable connection pooling to avoid stale connection issues
+		MaxIdleConns:        0,
+		MaxIdleConnsPerHost: 0,
+		IdleConnTimeout:     90 * time.Second,
+		// Increase TLS handshake timeout for slower/remote controllers
+		TLSHandshakeTimeout:   30 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		// Disable HTTP/2 to force HTTP/1.1 for better compatibility with UniFi
+		ForceAttemptHTTP2: false,
 
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: insecure,
@@ -48,27 +57,27 @@ func setHTTPClient(c *unifi.Client, insecure bool, subsystem string) {
 	c.SetHTTPClient(httpClient)
 }
 
-var initErr error
-
 func (c *lazyClient) init(ctx context.Context) error {
 	c.once.Do(func() {
 		c.inner = &unifi.Client{}
 		setHTTPClient(c.inner, c.insecure, c.subsystem)
 
-		initErr = c.inner.SetBaseURL(c.baseURL)
-		if initErr != nil {
+		c.initErr = c.inner.SetBaseURL(c.baseURL)
+		if c.initErr != nil {
+			log.Printf("[ERROR] Failed to set base URL: %v", c.initErr)
 			return
 		}
 
-		initErr = c.inner.InitWithAPIKey(ctx, c.apiKey)
-		if initErr != nil {
+		c.initErr = c.inner.InitWithAPIKey(ctx, c.apiKey)
+		if c.initErr != nil {
+			log.Printf("[ERROR] Failed to init with API key: %v", c.initErr)
 			return
 		}
 
-		initErr = checkMinimumControllerVersion(c.inner.Version())
+		c.initErr = checkMinimumControllerVersion(c.inner.Version())
 		log.Printf("[TRACE] Unifi controller version: %q", c.inner.Version())
 	})
-	return initErr
+	return c.initErr
 }
 
 func (c *lazyClient) Version() string {
