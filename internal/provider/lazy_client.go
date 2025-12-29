@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"sync"
 	"time"
 
@@ -16,6 +17,8 @@ import (
 
 type lazyClient struct {
 	baseURL   string
+	username  string
+	password  string
 	apiKey    string
 	insecure  bool
 	subsystem string
@@ -26,9 +29,14 @@ type lazyClient struct {
 }
 
 func setHTTPClient(c *unifi.Client, insecure bool, subsystem string) {
+	// Create cookie jar for session-based authentication (required for UniFi OS)
+	jar, _ := cookiejar.New(nil)
+
 	httpClient := &http.Client{
 		// Set overall request timeout to prevent hanging
 		Timeout: 60 * time.Second,
+		// Cookie jar is required to persist session cookies from /api/auth/login
+		Jar: jar,
 	}
 	httpClient.Transport = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -68,9 +76,25 @@ func (c *lazyClient) init(ctx context.Context) error {
 			return
 		}
 
-		c.initErr = c.inner.InitWithAPIKey(ctx, c.apiKey)
-		if c.initErr != nil {
-			log.Printf("[ERROR] Failed to init with API key: %v", c.initErr)
+		// Use username/password authentication if provided (recommended)
+		// Fall back to API key authentication otherwise
+		if c.username != "" && c.password != "" {
+			log.Printf("[DEBUG] Using username/password authentication")
+			c.initErr = c.inner.Login(ctx, c.username, c.password)
+			if c.initErr != nil {
+				log.Printf("[ERROR] Failed to login with username/password: %v", c.initErr)
+				return
+			}
+		} else if c.apiKey != "" {
+			log.Printf("[DEBUG] Using API key authentication (deprecated)")
+			c.initErr = c.inner.InitWithAPIKey(ctx, c.apiKey)
+			if c.initErr != nil {
+				log.Printf("[ERROR] Failed to init with API key: %v", c.initErr)
+				return
+			}
+		} else {
+			c.initErr = fmt.Errorf("no authentication method configured")
+			log.Printf("[ERROR] %v", c.initErr)
 			return
 		}
 

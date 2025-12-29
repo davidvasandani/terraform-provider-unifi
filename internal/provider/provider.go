@@ -29,14 +29,31 @@ func New(version string) func() *schema.Provider {
 	return func() *schema.Provider {
 		p := &schema.Provider{
 			Schema: map[string]*schema.Schema{
-				"api_key": {
-					Description: "API key for the UniFi controller. Can be specified with the `UNIFI_API_KEY` " +
-						"environment variable. Generate this from your UniFi controller under " +
-						"Settings > Control Plane > Integrations.",
+				"username": {
+					Description: "Local admin username for the UniFi controller. Can be specified with the " +
+						"`UNIFI_USERNAME` environment variable. Required when using username/password authentication. " +
+						"Create a local admin account (not cloud/SSO) on your controller for API access.",
 					Type:        schema.TypeString,
-					Required:    true,
+					Optional:    true,
+					DefaultFunc: schema.EnvDefaultFunc("UNIFI_USERNAME", ""),
+				},
+				"password": {
+					Description: "Local admin password for the UniFi controller. Can be specified with the " +
+						"`UNIFI_PASSWORD` environment variable. Required when using username/password authentication.",
+					Type:        schema.TypeString,
+					Optional:    true,
+					Sensitive:   true,
+					DefaultFunc: schema.EnvDefaultFunc("UNIFI_PASSWORD", ""),
+				},
+				"api_key": {
+					Description: "API key for the UniFi controller (deprecated - use username/password instead). " +
+						"Can be specified with the `UNIFI_API_KEY` environment variable. " +
+						"Note: API key authentication only works with the new integrations API, not legacy endpoints.",
+					Type:        schema.TypeString,
+					Optional:    true,
 					Sensitive:   true,
 					DefaultFunc: schema.EnvDefaultFunc("UNIFI_API_KEY", ""),
+					Deprecated:  "API key authentication is limited to read-only operations. Use username/password for full access.",
 				},
 				"api_url": {
 					Description: "URL of the controller API. Can be specified with the `UNIFI_API` environment variable. " +
@@ -102,13 +119,30 @@ func New(version string) func() *schema.Provider {
 
 func configure(version string, p *schema.Provider) schema.ConfigureContextFunc {
 	return func(ctx context.Context, d *schema.ResourceData) (interface{}, diag.Diagnostics) {
+		username := d.Get("username").(string)
+		password := d.Get("password").(string)
 		apiKey := d.Get("api_key").(string)
 		baseURL := d.Get("api_url").(string)
 		site := d.Get("site").(string)
 		insecure := d.Get("allow_insecure").(bool)
 
+		// Validate authentication configuration
+		hasUserPass := username != "" && password != ""
+		hasAPIKey := apiKey != ""
+
+		if !hasUserPass && !hasAPIKey {
+			return nil, diag.Errorf("Either username/password or api_key must be provided for authentication")
+		}
+
+		if hasUserPass && hasAPIKey {
+			// Prefer username/password, warn about api_key being ignored
+			return nil, diag.Errorf("Both username/password and api_key provided. Please use only one authentication method (username/password is recommended)")
+		}
+
 		c := &client{
 			c: &lazyClient{
+				username: username,
+				password: password,
 				apiKey:   apiKey,
 				baseURL:  baseURL,
 				insecure: insecure,
