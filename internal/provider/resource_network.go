@@ -292,6 +292,12 @@ func resourceNetwork() *schema.Resource {
 				Optional:    true,
 				Default:     false,
 			},
+			"exposed_to_site_vpn": {
+				Description: "Specifies whether this network should be exposed to Site Magic SD-WAN VPN.",
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+			},
 
 			"wan_ip": {
 				Description:  "The IPv4 address of the WAN.",
@@ -537,6 +543,14 @@ func resourceNetworkGetResourceData(d *schema.ResourceData, meta interface{}) (*
 		}
 	}
 
+	if v, ok := d.GetOk("exposed_to_site_vpn"); ok {
+		if boolValue, isBool := v.(bool); isBool {
+			network.ExposedToSiteVPN = boolValue
+		} else {
+			return nil, fmt.Errorf("invalid type for exposed_to_site_vpn: expected bool, got %T", v)
+		}
+	}
+
 	network.DHCPDV6LeaseTime = d.Get("dhcp_v6_lease").(int)
 	network.DHCPDV6Start = d.Get("dhcp_v6_start").(string)
 	network.DHCPDV6Stop = d.Get("dhcp_v6_stop").(string)
@@ -672,6 +686,7 @@ func resourceNetworkSetResourceData(resp *unifi.Network, d *schema.ResourceData,
 	d.Set("domain_name", resp.DomainName)
 	d.Set("igmp_snooping", resp.IGMPSnooping)
 	d.Set("internet_access_enabled", resp.InternetAccessEnabled)
+	d.Set("exposed_to_site_vpn", resp.ExposedToSiteVPN)
 
 	// Deprecated from paultyng/go-unifi - UnifiVersion = "7.4.162"
 	// d.Set("intra_network_access_enabled", resp.IntraNetworkAccessEnabled)
